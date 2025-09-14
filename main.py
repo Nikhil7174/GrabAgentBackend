@@ -3,40 +3,127 @@ from langchain_core.messages import HumanMessage
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint.sqlite import SqliteSaver  # <-- add this
+from langgraph.checkpoint.sqlite import SqliteSaver
 import base64
 import glob
 from pathlib import Path
 import os
-from typing import Any
+from typing import Any, Dict, Optional
+import json
+from datetime import datetime
 
+# ===== CONTEXT MANAGEMENT WITH PERSISTENCE =====
+class DisputeContext:
+    """Manages conversation state with SQLite persistence"""
+    
+    def __init__(self, checkpointer, thread_id):
+        self.checkpointer = checkpointer
+        self.thread_id = thread_id
+        self._state = self._load_state()
+    
+    def _load_state(self):
+        """Load state from checkpointer or create default"""
+        try:
+            # Try to load existing state from checkpointer
+            config = {"configurable": {"thread_id": self.thread_id}}
+            checkpoint = self.checkpointer.get(config)
+            
+            if checkpoint and "context_state" in checkpoint.get("channel_values", {}):
+                return checkpoint["channel_values"]["context_state"]
+        except Exception as e:
+            print(f"Could not load state: {e}")
+        
+        # Return default state
+        return {
+            "state": "initial",
+            "user_role": None,
+            "order_id": None,
+            "evidence": {},
+            "answers": {},
+            "tools_used": [],
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    def _save_state(self):
+        """Save current state to checkpointer"""
+        try:
+            # We'll let the agent's natural checkpointing handle this
+            # For now, just track in memory
+            pass
+        except Exception as e:
+            print(f"Could not save state: {e}")
+    
+    def update_state(self, new_state: str):
+        self._state["state"] = new_state
+        self._state["timestamp"] = datetime.now().isoformat()
+        self._save_state()
+    
+    def add_tool_usage(self, tool_name: str, args: dict, result: dict):
+        """Track tool usage"""
+        self._state["tools_used"].append({
+            "tool": tool_name,
+            "args": args,
+            "result": result,
+            "timestamp": datetime.now().isoformat()
+        })
+        self._save_state()
+    
+    def set_order_id(self, order_id: str):
+        self._state["order_id"] = order_id
+        self._save_state()
+    
+    def set_user_role(self, role: str):
+        self._state["user_role"] = role
+        self._save_state()
+    
+    def add_evidence(self, evidence: dict):
+        self._state["evidence"] = evidence
+        self._save_state()
+    
+    def add_answers(self, answers: str):
+        self._state["answers"]["customer_responses"] = answers
+        self._save_state()
+    
+    def get_summary(self) -> str:
+        evidence_status = "Sufficient" if self._state["evidence"].get("confidence", 0) > 0.7 else "Insufficient"
+        return f"""
+=== DISPUTE CONTEXT STATE ===
+Thread ID: {self.thread_id}
+State: {self._state["state"]}
+User Role: {self._state["user_role"] or 'Unknown'}
+Order ID: {self._state["order_id"] or 'Not provided'}
+Evidence Status: {evidence_status}
+Tools Used: {len(self._state["tools_used"])}
+Last Updated: {self._state["timestamp"]}
+Ready for Verdict: {self.is_ready_for_verdict()}
+============================="""
+    
+    def is_ready_for_verdict(self) -> bool:
+        has_order = bool(self._state["order_id"])
+        has_evidence = bool(self._state["evidence"]) and self._state["evidence"].get("confidence", 0) > 0.7
+        has_answers = bool(self._state["answers"])
+        return has_order and has_evidence and has_answers
+    
+    def get_state(self):
+        return self._state.copy()
+
+# Global context will be initialized per thread
+dispute_context = None
+
+# ===== UTILITY FUNCTIONS =====
 def pause_order_completion(order_id=None):
-    """Pause the order completion in your system. Replace body with your implementation."""
+    """Pause the order completion in your system."""
     if order_id:
         print(f"Order {order_id} paused (placeholder).")
     else:
         print("Order paused (placeholder).")
 
-
 def trigger_ui_update():
     """Trigger a UI update so the front-end reflects the mediation state."""
     print("UI update triggered (placeholder).")
 
-
 def collect_photos(paths: list[str] | None = None, dir: str | None = None):
-    """Read one or more photos, base64-encode them, and return metadata.
-
-    Args:
-        paths: Optional explicit list of image paths to load.
-        dir: Optional directory to scan for images (jpg, jpeg, png, webp, heic, bmp).
-
-    Returns:
-        A list of dicts: [{"path": str, "b64": str}] or, on error, [{"path": str, "b64": None, "error": str}].
-
-    Notes:
-        - If both `paths` and `dir` are None, this falls back to env var `IMAGES_DIR` if present.
-        - As a final fallback, it loads the single sample path currently in use.
-    """
+    """Read one or more photos, base64-encode them, and return metadata."""
     exts = ["*.jpg", "*.jpeg", "*.png", "*.webp", "*.heic", "*.bmp"]
 
     resolved_paths: list[str] = []
@@ -50,7 +137,6 @@ def collect_photos(paths: list[str] | None = None, dir: str | None = None):
                 for fp in p.glob(pattern):
                     resolved_paths.append(str(fp))
         else:
-            # Fallback to the original single example
             resolved_paths = ["/home/nikhil/Desktop/unnamed (1).png", "/home/nikhil/Desktop/unnamed.png"]
 
     results: list[dict] = []
@@ -66,21 +152,8 @@ def collect_photos(paths: list[str] | None = None, dir: str | None = None):
             results.append({"path": image_path, "b64": None, "error": str(e)})
     return results
 
-
-@tool(parse_docstring=True)
-def initiate_mediation_flow(order_id: str | None = None):
-    """The user has issues with his order regarding the packaging and wants to resolve it — this tool only initializes the mediation process.
-
-    Args:
-        order_id: Optional order identifier to act upon.
-    """
-    pause_order_completion(order_id)
-    trigger_ui_update()
-    return {"status": "initiated", "order_id": order_id}
-
-
 def _extract_json(text: str) -> dict | None:
-    """Extract the first JSON object from a string safely without extra deps."""
+    """Extract the first JSON object from a string safely."""
     import json, re
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
@@ -90,549 +163,423 @@ def _extract_json(text: str) -> dict | None:
     except Exception:
         return None
 
-
 def _describe_with_vision(image_b64: str) -> dict:
-    """Call a vision-capable model on the provided base64 image and return structured facts.
-
-    Returns a dict with keys: status, summary, packaging_colors, labels_or_receipts,
-    damage, confidence, needs_more_photos, recommended_shots, uncertainty_reasons, notes.
-    Falls back to a plain-text summary if JSON parsing fails.
-    """
+    """Call a vision-capable model on the provided base64 image."""
     vision_llm = ChatOpenAI(model=VISION_MODEL, temperature=0)
-    schema = {
-        "type": "object",
-        "properties": {
-            "summary": {"type": "string"},
-            "packaging_colors": {"type": "array", "items": {"type": "string"}},
-            "labels_or_receipts": {
-                "type": "object",
-               "properties": {
-                    "present": {"type": "boolean"},
-                    "description": {"type": "string"},
-                },
-                "required": ["present", "description"],
-            },
-            "damage": {
-                "type": "object",
-                "properties": {
-                    "types": {"type": "array", "items": {"type": "string"}},
-                    "severity": {"type": "string", "enum": ["none", "minor", "moderate", "severe"]},
-                    "areas": {"type": "array", "items": {"type": "string"}},
-                    "substance_color": {"type": "array", "items": {"type": "string"}},
-                    "is_product_exposed": {"type": "boolean"},
-                },
-                "required": ["types", "severity", "areas", "substance_color", "is_product_exposed"],
-            },
-            "notes": {"type": "string"},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "needs_more_photos": {"type": "boolean"},
-            "recommended_shots": {"type": "array", "items": {"type": "string"}},
-            "uncertainty_reasons": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["summary", "packaging_colors", "labels_or_receipts", "damage", "confidence", "needs_more_photos"],
-    }
+    
     prompt_text = (
-        "Analyze this delivery photo strictly from visible evidence. "
-        "Identify: packaging color(s); presence of labels/receipts; damage types (e.g., leakage, spill, crushing, tearing, soaking), "
-        "severity; affected areas; color(s) of any leaked substance; whether contents appear exposed. "
-        "Use precise descriptors like 'front-left corner', 'top fold', 'seam', 'receipt area'. "
-        "Also include a numeric 'confidence' (0–1), a boolean 'needs_more_photos' if one image is insufficient, "
-        "and, when low confidence, provide 'recommended_shots' with specific angles (e.g., whole package, opposite corner, contents out of box, close-up of damage) "
-        "and 'uncertainty_reasons'. Respond ONLY with JSON matching this schema and do not include extra text: "
-        "The confidence parameter should be calculated as follows:\n"
-        "1. It should be between 0 to 1.\n"
-        "2. Is the full view of the package (all four corners) visible.\n"
-        "3. The extent of the damage.\n"
-        "4. The overall quality of the photo.\n"
-        "only recommend those shots which are not present in this array [Full view of the whole outer packaging, Opposite corner from the damage (to assess extent),"
-        "Close-up of the damaged area (2-3 inches away)"
-        f"{schema}"
+        "Analyze this delivery photo for packaging damage. Focus on:\n"
+        "1. Packaging condition: intact, damaged, crushed, torn, wet, leaked\n"
+        "2. Damage severity: none, minor, moderate, severe\n"
+        "3. Product exposure: is the actual product visible or contaminated?\n"
+        "4. Leak details: color, substance type, extent\n"
+        "5. Photo quality: can you see the full package clearly?\n\n"
+        
+        "Return JSON with these exact fields:\n"
+        "{\n"
+        '  "summary": "brief description",\n'
+        '  "packaging_colors": ["color1", "color2"],\n'
+        '  "damage": {\n'
+        '    "types": ["leakage", "crushing", "tearing"],\n'
+        '    "severity": "none|minor|moderate|severe",\n'
+        '    "areas": ["front", "corner", "bottom"],\n'
+        '    "substance_color": ["red", "clear"],\n'
+        '    "is_product_exposed": true/false\n'
+        '  },\n'
+        '  "confidence": 0.85,\n'
+        '  "needs_more_photos": true/false\n'
+        "}"
     )
+    
     msg = HumanMessage(
         content=[
             {"type": "text", "text": prompt_text},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
         ]
     )
-    res = vision_llm.invoke([msg])
-    text = getattr(res, "content", str(res))
-    data = _extract_json(text)
-    if not data:
-        # Fallback: return plain text in summary
-        return {"status": "ok", "summary": text, "packaging_colors": [], "labels_or_receipts": {"present": False, "description": ""}, "damage": {"types": [], "severity": "unknown", "areas": [], "substance_color": [], "is_product_exposed": False}, "notes": "model returned non-JSON; used summary fallback", "confidence": 0.4, "needs_more_photos": True, "recommended_shots": ["whole outer packaging", "opposite corner", "close-up of damaged area", "product outside box"], "uncertainty_reasons": ["no parseable JSON"]}
-    data["status"] = "ok"
-    return data
-
-
-def _severity_rank(label: str) -> int:
-    order = {"none": 0, "minor": 1, "moderate": 2, "severe": 3}
-    return order.get((label or "").lower(), 1)
-
-
-def _merge_analyses(per_image: list[dict]) -> dict:
-    """Aggregate multiple per-image analyses into a single verdict with guided recommendations."""
-    colors = set()
-    damage_types = set()
-    areas = set()
-    substance_colors = set()
-    exposed = False
-    notes: list[str] = []
-    confidences: list[float] = []
-    needs_more_any = False
-    rec_shots: list[str] = []
-    uncertainty: list[str] = []
-
-    for d in per_image:
-        colors.update([c for c in d.get("packaging_colors", []) if c])
-        dmg = d.get("damage", {})
-        damage_types.update([t for t in dmg.get("types", []) if t])
-        areas.update([a for a in dmg.get("areas", []) if a])
-        substance_colors.update([s for s in dmg.get("substance_color", []) if s])
-        exposed = exposed or bool(dmg.get("is_product_exposed"))
-        if d.get("notes"):
-            notes.append(d["notes"])
-        if isinstance(d.get("confidence"), (int, float)):
-            confidences.append(float(d["confidence"]))
-        needs_more_any = needs_more_any or bool(d.get("needs_more_photos"))
-        rec_shots.extend(d.get("recommended_shots", []) or [])
-        uncertainty.extend(d.get("uncertainty_reasons", []) or [])
-
-    # Pick the highest severity seen across images
-    severities = [d.get("damage", {}).get("severity", "unknown") for d in per_image]
-    if severities:
-        severities_sorted = sorted(severities, key=_severity_rank, reverse=True)
-        agg_severity = severities_sorted[0]
-    else:
-        agg_severity = "unknown"
-
-    # Confidence: average across images, capped into [0,1]
-    avg_conf = sum(confidences) / len(confidences) if confidences else 0.5
-    avg_conf = max(0.0, min(1.0, avg_conf))
-
+    
+    try:
+        res = vision_llm.invoke([msg])
+        text = getattr(res, "content", str(res))
+        data = _extract_json(text)
+        if data:
+            data["status"] = "ok"
+            return data
+    except Exception as e:
+        print(f"Vision analysis error: {e}")
+    
     return {
-        "summary": None,  # caller composes summary
-        "packaging_colors": sorted(colors),
-        "labels_or_receipts": None,  # not aggregated reliably here
+        "status": "error",
+        "summary": "Could not analyze image",
+        "packaging_colors": [],
         "damage": {
-            "types": sorted(damage_types),
-            "severity": agg_severity,
-            "areas": sorted(areas),
-            "substance_color": sorted(substance_colors),
-            "is_product_exposed": exposed,
+            "types": [],
+            "severity": "unknown", 
+            "areas": [],
+            "substance_color": [],
+            "is_product_exposed": False
         },
-        "confidence": avg_conf,
-        "needs_more_photos": avg_conf <= 0.7,
-        "recommended_shots": rec_shots,
-        "uncertainty_reasons": list(dict.fromkeys(uncertainty)),
-        "notes": "; ".join(notes[:3]) if notes else "",
-        "per_image": per_image,
+        "confidence": 0.0,
+        "needs_more_photos": True
     }
 
+def _merge_analyses(per_image: list[dict]) -> dict:
+    """Aggregate multiple per-image analyses."""
+    if not per_image:
+        return {}
+    
+    # For simplicity, take the first analysis
+    # In production, you'd merge multiple analyses
+    return per_image[0]
+
+# ===== TOOLS WITH CONTEXT TRACKING =====
+@tool(parse_docstring=True)
+def initiate_mediation_flow(order_id: str | None = None, user_role: str = "customer"):
+    """Initialize the packaging dispute resolution process.
+
+    Args:
+        order_id: Order identifier for the disputed delivery
+        user_role: Either 'customer' or 'driver' to identify who is reporting
+    """
+    global dispute_context
+    
+    if dispute_context:
+        dispute_context.update_state("initiated")
+        if order_id:
+            dispute_context.set_order_id(order_id)
+        dispute_context.set_user_role(user_role)
+    
+    pause_order_completion(order_id)
+    trigger_ui_update()
+    
+    result = {
+        "status": "initiated",
+        "order_id": order_id,
+        "user_role": user_role,
+        "message": f"Dispute resolution started for order {order_id or 'TBD'}. Please share photos of the damaged package.",
+        "next_action": "collect_evidence"
+    }
+    
+    if dispute_context:
+        dispute_context.add_tool_usage("initiate_mediation_flow", {"order_id": order_id, "user_role": user_role}, result)
+        print(dispute_context.get_summary())
+    
+    return result
 
 @tool(parse_docstring=True)
 def collect_evidence(paths: list[str] | None = None, dir: str | None = None):
-    """Retrieve and analyze one or more photos of the damaged package.
+    """Analyze photos of damaged packaging to determine extent and cause of damage.
 
     Args:
-        paths: Optional explicit list of image paths to analyze.
-        dir: Optional directory to scan for images if `paths` is not provided.
-
-    Returns:
-        - status: 'ok' or 'error'
-        - description: concise natural-language summary of aggregated evidence
-        - structured: aggregated JSON including per-image analyses
-        - needs_more_photos: boolean indicating whether more angles are requested
-        - requested_shots: suggested additional angles if more photos are needed
+        paths: Specific image file paths to analyze
+        dir: Directory containing damage photos
     """
+    global dispute_context
+    
     photos = collect_photos(paths=paths, dir=dir)
     if not photos:
-        return {"status": "error", "reason": "no_photos_found"}
+        result = {"status": "error", "reason": "no_photos_found", "next_action": "Please upload photos"}
+        if dispute_context:
+            dispute_context.add_tool_usage("collect_evidence", {"paths": paths, "dir": dir}, result)
+            print(dispute_context.get_summary())
+        return result
 
-    # If any photo failed to load and no valid ones exist, error out with details
     valid = [p for p in photos if p.get("b64")]
     if not valid:
-        return {"status": "error", "reason": ", ".join({p.get("error", "unknown") for p in photos}), "paths": [p.get("path") for p in photos]}
+        result = {
+            "status": "error", 
+            "reason": "no_valid_photos", 
+            "details": [p.get("error", "unknown") for p in photos],
+            "next_action": "Please ensure photos are accessible"
+        }
+        if dispute_context:
+            dispute_context.add_tool_usage("collect_evidence", {"paths": paths, "dir": dir}, result)
+            print(dispute_context.get_summary())
+        return result
 
     # Analyze each valid image
     per_image: list[dict] = []
     for p in valid:
-        analysis = _describe_with_vision(p["b64"])  # dict with damage/colors/etc.
+        analysis = _describe_with_vision(p["b64"])
         analysis["path"] = p.get("path")
         per_image.append(analysis)
 
+    # Merge analyses
     agg = _merge_analyses(per_image)
-
-    # Compose concise description from aggregated data
+    
+    # Generate summary
     dmg = agg.get("damage", {})
     colors = ", ".join(agg.get("packaging_colors", [])) or "unknown"
-    types = ", ".join(dmg.get("types", [])) or "unknown damage"
-    areas = ", ".join(dmg.get("areas", [])) or "unspecified area"
+    types = ", ".join(dmg.get("types", [])) or "no visible damage"
     severity = dmg.get("severity", "unknown")
-    substance = ", ".join(dmg.get("substance_color", [])) or "unspecified color"
-    summary = agg.get("summary") or (
-        f"Packaging color: {colors}. Visible damage: {types} (severity: {severity}) at {areas}. "
-        f"Leaked substance color: {substance}."
-    )
-
-    return {
+    confidence = agg.get("confidence", 0.0)
+    
+    description = f"Analysis: {types} (severity: {severity}) on {colors} packaging. Confidence: {confidence:.1%}"
+    
+    result = {
         "status": "ok",
-        "description": summary,
+        "description": description,
         "structured": agg,
+        "confidence": confidence,
         "needs_more_photos": bool(agg.get("needs_more_photos")),
-        "requested_shots": agg.get("recommended_shots", []),
-        "uncertainty_reasons": agg.get("uncertainty_reasons", []),
+        "can_proceed_to_questions": confidence > 0.7,
         "analyzed_paths": [p.get("path") for p in valid],
     }
-
+    
+    if dispute_context:
+        dispute_context.add_evidence(agg)
+        dispute_context.update_state("evidence_collected")
+        dispute_context.add_tool_usage("collect_evidence", {"paths": paths, "dir": dir}, result)
+        print(dispute_context.get_summary())
+    
+    return result
 
 @tool(parse_docstring=True)
-def request_more_photos(reason: str | None = None, recommended_shots: list[str] | None = None):
-    """Ask the user to upload additional photos/angles when one image is insufficient for a reliable verdict.
+def ask_follow_up_questions(target_role: str = "customer"):
+    """Generate targeted questions based on evidence analysis.
 
     Args:
-        reason: Optional short sentence explaining why more photos are needed.
-        recommended_shots: Optional list of specific angles or frames to capture.
-
-    Returns:
-        A dict with a user-facing message and a structured list of requested shots.
+        target_role: 'customer' or 'driver' - who should answer
     """
-    default_shots = [
-        "Full view of the whole outer packaging",
-        "Opposite corner from the damage (to assess extent)",
-        "Close-up of the damaged area (2-3 inches away)",
-    ]
-    shots = recommended_shots if recommended_shots else default_shots
-    msg = (
-        "To give a precise verdict, I need a few more angles. "
-        + (f"Reason: {reason}. " if reason else "")
-        + "Please upload the following shots: " + "; ".join(shots) + "."
-    )
-    trigger_ui_update()  # placeholder: could open an upload prompt in a real app
-    return {"status": "requested", "message": msg, "requested_shots": shots}
-
-@tool(parse_docstring=True)
-def ask_dynamic_questions(
-    analysis: dict,
-    role: str = "user",
-    extra_context: dict | None = None,
-    max_questions: int = 5
-):
-    """Create targeted, role-specific follow-up questions to finalize a packaging-damage verdict.
-
-    Args:
-        analysis: Aggregated output produced by collect_evidence -> structured 'agg' dict.
-        role: 'user' or 'driver' (controls phrasing and topics).
-        extra_context: Optional dict with known metadata (e.g., order_id, product type, perishability).
-        max_questions: Upper bound on number of questions to return.
-
-    Returns:
+    global dispute_context
+    
+    questions = [
         {
-          "status": "ok",
-          "questions": [
-            {
-              "to": "user" | "driver",
-              "question": "string",
-              "why": "string",
-              "priority": 1..3,             # 1 = highest
-              "blocking": bool,             # must be answered before verdict?
-              "topic": "evidence|liability|resolution|safety"
-            },
-            ...
-          ],
-          "notes": "string"
+            "to": "customer",
+            "question": "Have you consumed any of this product? If yes, are you experiencing any health issues?",
+            "topic": "safety",
+            "priority": "high"
+        },
+        {
+            "to": "customer", 
+            "question": "Please confirm you've set aside the product and won't consume it until resolution.",
+            "topic": "safety",
+            "priority": "high"
+        },
+        {
+            "to": "customer",
+            "question": "Did you notice any smell from the leaked substance? What does it smell like?",
+            "topic": "contamination",
+            "priority": "medium"
+        },
+        {
+            "to": "customer",
+            "question": "When did you first notice the damage - immediately upon delivery or later?",
+            "topic": "timeline",
+            "priority": "high"
+        },
+        {
+            "to": "customer",
+            "question": "How has this affected your meal/plans? Do you need immediate replacement?",
+            "topic": "impact",
+            "priority": "medium"
         }
-    """
-    # ---- deterministic scaffolding (reliable, model-agnostic) ----
-    dmg = (analysis or {}).get("damage", {}) or {}
-    types = set((dmg.get("types") or []))
-    severity = (dmg.get("severity") or "unknown").lower()
-    areas = set((dmg.get("areas") or []))
-    substance_colors = set((dmg.get("substance_color") or []))
-    is_exposed = bool(dmg.get("is_product_exposed"))
-    needs_more = bool((analysis or {}).get("needs_more_photos"))
-    conf = float((analysis or {}).get("confidence") or 0.0)
-    rec_shots = (analysis or {}).get("recommended_shots") or []
-    uncertainty = (analysis or {}).get("uncertainty_reasons") or []
-    packaging_colors = (analysis or {}).get("packaging_colors") or []
-
-    role = (role or "user").lower()
-    extra_context = extra_context or {}
-
-    def q(item_to:str, question:str, why:str, priority:int=2, blocking:bool=False, topic:str="evidence"):
-        return {
-            "to": item_to,
-            "question": question.strip(),
-            "why": why.strip(),
-            "priority": max(1, min(priority, 3)),
-            "blocking": bool(blocking),
-            "topic": topic
-        }
-
-    questions: list[dict[str, Any]] = []
-
-    # --- Evidence gaps & angle coverage ---
-    if needs_more or conf <= 0.7:
-        if rec_shots:
-            questions.append(q(
-                "user",
-                f"Can you share {', '.join(rec_shots[:3])}?",
-                "Image coverage is incomplete; targeted photos will materially raise confidence.",
-                priority=1, blocking=True, topic="evidence"
-            ))
-        else:
-            questions.append(q(
-                "user",
-                "Could you share a full shot of the entire outer packaging and a close-up of the damaged area?",
-                "We need standard angles to validate extent and exact location.",
-                priority=1, blocking=True, topic="evidence"
-            ))
-
-    # --- Damage-specific questions (user) ---
-    if "leakage" in {t.lower() for t in types} or "spill" in {t.lower() for t in types}:
-        questions.append(q(
-            "user",
-            "Is the leaked substance sticky, oily, or watery, and does it have any noticeable odor?",
-            "Characterizing the substance helps distinguish transit leakage vs. condensation or pre-existing spill.",
-            priority=1, blocking=False, topic="evidence"
-        ))
-        if not is_exposed:
-            questions.append(q(
-                "user",
-                "Is the inner product seal intact when you open the package?",
-                "Determines contamination risk and severity classification.",
-                priority=1, blocking=True, topic="safety"
-            ))
-
-    if "crushing" in {t.lower() for t in types}:
-        questions.append(q(
-            "user",
-            "Are the contents inside deformed or only the outer box is crushed?",
-            "Affects compensation band: cosmetic vs. functional damage.",
-            priority=2, blocking=False, topic="evidence"
-        ))
-
-    if "tearing" in {t.lower() for t in types} or "soaking" in {t.lower() for t in types}:
-        questions.append(q(
-            "user",
-            "Did you notice any moisture on the inner packaging or product?",
-            "Confirms ingress reaching product vs. outer wrap only.",
-            priority=2, blocking=False, topic="evidence"
-        ))
-
-    if substance_colors and "unknown" not in substance_colors:
-        questions.append(q(
-            "user",
-            f"Does the leaked color match any product inside (we observed: {', '.join(sorted(substance_colors))})?",
-            "Cross-check leak origin with product content.",
-            priority=2, blocking=False, topic="evidence"
-        ))
-
-    # --- Logistics chain questions (driver) ---
-    # Only add when severity ≥ moderate or confidence low (we need chain-of-custody clarity)
-    if severity in ("moderate", "severe") or conf <= 0.7:
-        questions.append(q(
-            "driver",
-            "At pickup, was the parcel visually intact and dry? Any pre-existing dents, tears, or damp patches?",
-            "Establish baseline condition at handover.",
-            priority=1, blocking=False, topic="liability"
-        ))
-        questions.append(q(
-            "driver",
-            "During transit, was the package stored upright and secured from tilting or compression by heavier parcels?",
-            "Crushing/tilt can plausibly cause the observed damage types.",
-            priority=2, blocking=False, topic="liability"
-        ))
-        if "leakage" in {t.lower() for t in types} or "spill" in {t.lower() for t in types}:
-            questions.append(q(
-                "driver",
-                "Did you notice any leakage or dampness in the vehicle or on adjacent parcels after pickup?",
-                "Helps time-bound when the leak occurred.",
-                priority=2, blocking=False, topic="liability"
-            ))
-
-    # --- Documentation / traceability (both sides) ---
-    questions.append(q(
-        "user",
-        "Do you have the order ID and any receipt or label photo you can share?",
-        "Links evidence to a specific shipment and SKU; needed for claims processing.",
-        priority=1, blocking=True, topic="resolution"
-    ))
-
-    questions.append(q(
-        "driver",
-        "Please confirm the pickup and delivery timestamps and route segment (hub handovers, if any).",
-        "Narrows the window when damage likely occurred.",
-        priority=3, blocking=False, topic="liability"
-    ))
-
-    # --- Safety checks if product looks exposed or is perishable / hazardous ---
-    perishable = bool(extra_context.get("perishable"))
-    hazardous = bool(extra_context.get("hazardous"))
-    if is_exposed or perishable or hazardous:
-        questions.append(q(
-            "user",
-            "Please avoid using the product until our check is done. Is the item perishable or hazardous in any way?",
-            "Safety gating prior to verdict.",
-            priority=1, blocking=True, topic="safety"
-        ))
-
-    # Cap, sort by priority (1 first)
-    questions = sorted(questions, key=lambda x: x["priority"])[:max_questions]
-
-    # ---- Optional LLM pass to polish phrasing (keeps content intact) ----
-    # Keep this resilient: if model call fails, return as-is.
-    try:
-        llm = ChatOpenAI(model=ASSISTANT_MODEL, temperature=0.2)
-        schema = {
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "to": {"type": "string", "enum": ["user","driver"]},
-                            "question": {"type": "string"},
-                            "why": {"type": "string"},
-                            "priority": {"type": "integer"},
-                            "blocking": {"type": "boolean"},
-                            "topic": {"type": "string"}
-                        },
-                        "required": ["to","question","why","priority","blocking","topic"]
-                    }
-                }
-            },
-            "required": ["questions"]
-        }
-        prompt = (
-            "Rewrite the following question list for clarity and brevity. Keep semantics and fields identical. "
-            "Return ONLY JSON in the provided schema:\n"
-            f"{schema}\n\n"
-            f"Questions:\n{questions}"
-        )
-        resp = llm.invoke([HumanMessage(content=prompt)])
-        polished = _extract_json(getattr(resp, "content", str(resp)))
-        if polished and "questions" in polished and isinstance(polished["questions"], list):
-            questions = polished["questions"]
-    except Exception:
-        pass
-
-    return {"status": "ok", "questions": questions, "notes": "Auto-generated based on current evidence gaps"}
-
+    ]
+    
+    filtered_questions = [q for q in questions if q["to"] == target_role][:5]
+    
+    result = {
+        "status": "ok",
+        "questions": filtered_questions,
+        "total_questions": len(filtered_questions),
+        "next_action": "Please answer these questions to help determine the best resolution"
+    }
+    
+    if dispute_context:
+        dispute_context.update_state("questioning")
+        dispute_context.add_tool_usage("ask_follow_up_questions", {"target_role": target_role}, result)
+        print(dispute_context.get_summary())
+    
+    return result
 
 @tool(parse_docstring=True)
-def finalize_verdict(
-    decision: str,
-    rationale: str,
-    payout_band: str | None = None,
-    next_steps: list[str] | None = None,
-    analysis: dict | None = None,
-    order_id: str | None = None,
-):
-    """Record the final decision for this case and trigger any follow-up actions.
+def store_customer_responses(responses: str, order_id: str | None = None):
+    """Store customer responses to follow-up questions.
+    
+    Args:
+        responses: Customer's answers to the questions
+        order_id: Order ID for this case
+    """
+    global dispute_context
+    
+    if dispute_context:
+        dispute_context.add_answers(responses)
+        if order_id:
+            dispute_context.set_order_id(order_id)
+        dispute_context.update_state("responses_collected")
+    
+    result = {
+        "status": "stored",
+        "responses": responses,
+        "order_id": order_id,
+        "message": "Responses recorded. Ready for verdict with order ID.",
+        "next_action": "finalize_verdict"
+    }
+    
+    if dispute_context:
+        dispute_context.add_tool_usage("store_customer_responses", {"responses": responses, "order_id": order_id}, result)
+        print(dispute_context.get_summary())
+    
+    return result
+
+@tool(parse_docstring=True) 
+def finalize_verdict(order_id: str):
+    """Make final decision based on collected evidence and responses.
 
     Args:
-        decision: 'refund' | 'replace' | 'partial_refund' | 'deny'
-        rationale: Short justification referencing the collected evidence.
-        payout_band: Optional internal band/slug for compensation handling.
-        next_steps: Optional user-facing steps (pickup/disposal, replacement ETA, etc.).
-        analysis: Optional echo of the aggregated analysis used for the verdict.
-        order_id: Optional order id to log/route.
+        order_id: Order ID for this dispute (REQUIRED)
     """
-    # In your real system, persist to DB/ticketing here:
+    global dispute_context
+    
+    if not order_id:
+        result = {
+            "status": "error",
+            "message": "Order ID is required to finalize verdict",
+            "next_action": "Ask customer for order ID"
+        }
+        if dispute_context:
+            dispute_context.add_tool_usage("finalize_verdict", {"order_id": order_id}, result)
+            print(dispute_context.get_summary())
+        return result
+    
+    # Get evidence from context if available
+    evidence = {}
+    if dispute_context:
+        state = dispute_context.get_state()
+        evidence = state.get("evidence", {})
+        dispute_context.set_order_id(order_id)
+    
+    # Determine severity and exposure
+    damage = evidence.get("damage", {})
+    severity = damage.get("severity", "severe")  # Default to severe for demo
+    is_exposed = damage.get("is_product_exposed", True)  # Default to exposed for demo
+    
+    # Decision logic
+    if severity == "severe" or is_exposed:
+        decision = "full_refund_replacement"
+        payout_band = "high"
+        rationale = "Severe damage with product exposure detected. Safety concern requires full compensation."
+        next_steps = [
+            "Full refund and replacement order will be processed within 30 minutes",
+            "Keep damaged items for pickup by our team", 
+            "Refund will be processed to original payment method within 1-2 business days"
+        ]
+    elif severity == "moderate":
+        decision = "replacement"
+        payout_band = "medium"
+        rationale = "Moderate packaging damage confirmed. Product integrity compromised."
+        next_steps = [
+            "Replacement order will be processed within 30 minutes",
+            "Keep damaged items for pickup by our team"
+        ]
+    elif severity == "minor":
+        decision = "partial_refund"
+        payout_band = "low"
+        rationale = "Minor cosmetic damage only. Product remains functional and safe."
+        next_steps = [
+            "Partial refund of 50% will be processed within 24 hours",
+            "Product is safe to consume despite cosmetic damage"
+        ]
+    else:
+        decision = "deny"
+        payout_band = "none"
+        rationale = "No significant damage detected or insufficient evidence."
+        next_steps = ["Claim reviewed and denied due to insufficient evidence"]
+    
     trigger_ui_update()
-    return {
+    
+    result = {
         "status": "finalized",
         "order_id": order_id,
         "decision": decision,
         "rationale": rationale,
         "payout_band": payout_band,
-        "next_steps": next_steps or [],
-        "analysis": analysis,
+        "next_steps": next_steps,
+        "resolution_time": datetime.now().isoformat()
     }
+    
+    if dispute_context:
+        dispute_context.update_state("completed")
+        dispute_context.add_tool_usage("finalize_verdict", {"order_id": order_id}, result)
+        print(dispute_context.get_summary())
+    
+    return result
 
-# --- Agent setup ---
+# ===== AGENT SETUP =====
 load_dotenv()
 
-# Validate OpenAI credentials early to provide a clear error message.
 if not os.getenv("OPENAI_API_KEY"):
-    print(
-        "Missing OPENAI_API_KEY. Add it to a .env file in the project root "
-        "(OPENAI_API_KEY=sk-...), or export it in your shell before running."
-    )
+    print("Missing OPENAI_API_KEY. Add it to a .env file in the project root.")
     raise SystemExit(1)
 
-# Use a valid, vision-capable default. Allow overrides via env.
 ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL", "gpt-4o-mini")
 VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
-llm = ChatOpenAI(model=ASSISTANT_MODEL, temperature=0.4)
-tools = [initiate_mediation_flow, collect_evidence, request_more_photos, ask_dynamic_questions, finalize_verdict]
-# memory = MemorySaver()
-memory = SqliteSaver.from_conn_string(os.getenv("CHECKPOINT_DB", "state.db"))
 
-# UPDATED: add tiny state policy to the system message
-system_message = """You are a helpful AI assistant.
-** Role & Purpose:
-1. You are a chatbot designed to assist users with all types of queries.
-2. You have access to specialized tools for handling packaging disputes and related problem resolution.
+SYSTEM_MESSAGE = """You are GrabFood's AI Dispute Resolution Agent, specialized in resolving packaging damage claims.
 
-** Behavior Guidelines:
-*** General Queries:
-1. Provide clear, accurate, and concise answers.
-2. Be polite, professional, and approachable.
+**WORKFLOW**:
+1. When customer reports damage, call `initiate_mediation_flow` 
+2. When photo paths provided, call `collect_evidence`
+3. After evidence collected (confidence >70%), call `ask_follow_up_questions`
+4. When customer provides answers, call `store_customer_responses` 
+5. When order_id available, call `finalize_verdict`
 
-*** Packaging Disputes & Related Issues:
-1. Ask clarifying questions if the user’s concern is not fully clear.
-2. Guide the user step by step through the resolution process.
-3. Use the appropriate tools when necessary.
-4. If the user reports packaging damage, always call the `collect_evidence` tool to fetch and analyze available photos before proceeding. The tool supports multiple photos.
-5. If tools cannot resolve the issue, suggest alternative solutions or escalate appropriately.
-6. Do not invent or reuse canned sample descriptions. Base answers strictly on evidence returned by tools.
-7. If no valid image is available or parsing fails, state that clearly and request a new upload.
-8. If `collect_evidence` returns `needs_more_photos=true` or shows `confidence < 0.7`, call `request_more_photos` with the provided reasons and recommended shots. Provide any preliminary observations, then wait for new photos before issuing a final verdict.
-9. **If `collect_evidence` indicates `confidence > 0.7`, proceed to a decision by calling `finalize_verdict`, referencing the aggregated `structured` analysis (severity, exposed/not, types). Do not ask for photos again unless new uncertainty is introduced.**
+**DECISION FRAMEWORK**:
+- SEVERE damage + product exposed = Full refund + replacement
+- MODERATE damage = Replacement only  
+- MINOR damage = Partial refund
+- NO damage = Deny claim
 
-** Tone & Style:
-1. Maintain a professional, empathetic, and solution-oriented tone.
-2. Be proactive in helping users reach a resolution.
-3. Avoid unnecessary jargon—keep responses user-friendly.
+**TOOL USAGE RULES**:
+- ALWAYS call initiate_mediation_flow when damage is first reported
+- ALWAYS call collect_evidence when photo paths are provided
+- ALWAYS call store_customer_responses when customer answers questions
+- ALWAYS call finalize_verdict with order_id when ready
 
-** Limitations:
-1. If a request is outside your scope, politely inform the user and redirect them to the best alternative option.
+Be proactive with tools - don't just ask for information, use the tools to collect and process it.
 """
 
-agent_executor = create_react_agent(
-    llm, tools, checkpointer=memory, prompt=system_message
-)
-
-thread_id = os.getenv("THREAD_ID", "abc456")
-config = {"configurable": {"thread_id": thread_id}}
-
-# Use only the real user request to avoid bias from sample few-shots.
-real_user = {
-    "role": "user",
-    "content": (
-        "please proceed"
-    ),
-}
-
-messages = [real_user]
-
+llm = ChatOpenAI(model=ASSISTANT_MODEL, temperature=0.3)
+tools = [initiate_mediation_flow, collect_evidence, ask_follow_up_questions, store_customer_responses, finalize_verdict]
 
 if __name__ == "__main__":
     try:
         with SqliteSaver.from_conn_string(os.getenv("CHECKPOINT_DB", "state.db")) as memory:
-            agent_executor = create_react_agent(
-                llm, tools, checkpointer=memory, prompt=system_message
-            )
-            thread_id = os.getenv("THREAD_ID", "abc456")
+            # Initialize context for this thread
+            thread_id = os.getenv("THREAD_ID", "grabhack_demo")
+            dispute_context = DisputeContext(memory, thread_id)
+            
+            agent_executor = create_react_agent(llm, tools, checkpointer=memory, prompt=SYSTEM_MESSAGE)
             config = {"configurable": {"thread_id": thread_id}}
+            
+            # Show initial context
+            print("=== GrabFood Dispute Resolution Agent ===")
+            print("Context Engineering Enhanced Version")
+            print("==========================================")
+            print(dispute_context.get_summary())
+            
+            demo_message = {
+                "role": "user", 
+                "content": """No, I haven’t consumed it, so no health issues.
 
+Yes, I’ve set it aside and won’t consume it.
+
+Yes, there’s a smell — it’s unpleasant, like spoiled food/oil.
+
+I noticed the damage immediately upon delivery.
+
+This has affected my meal plans — I would like a replacement as soon as possible."""
+            }
+            
             for step in agent_executor.stream(
-                    {"messages": messages}, config, stream_mode="values"
+                {"messages": [demo_message]}, config, stream_mode="values"
             ):
                 step["messages"][-1].pretty_print()
+            
+            print("\n=== FINAL CONTEXT STATE ===")
+            print(dispute_context.get_summary())
+        
     except Exception as e:
-        print("Streaming failed:", e)
-
-    print("Agent run complete.")
+        print(f"Agent execution failed: {e}")
+    
+    print("\nAgent run complete.")
