@@ -10,30 +10,63 @@ from pathlib import Path
 import os
 from typing import Any, Dict, Optional
 import json
+import sqlite3
 from datetime import datetime
 
-# ===== CONTEXT MANAGEMENT WITH PERSISTENCE =====
+# ===== ENHANCED CONTEXT MANAGEMENT WITH PROPER PERSISTENCE =====
 class DisputeContext:
-    """Manages conversation state with SQLite persistence"""
+    """Manages conversation state with proper SQLite persistence"""
     
     def __init__(self, checkpointer, thread_id):
         self.checkpointer = checkpointer
         self.thread_id = thread_id
+        self.db_path = "dispute_context.db"
+        self._init_db()
         self._state = self._load_state()
     
+    def _init_db(self):
+        """Initialize SQLite database for context persistence"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dispute_contexts (
+                    thread_id TEXT PRIMARY KEY,
+                    state_json TEXT,
+                    last_updated TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS context_backups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT,
+                    state_json TEXT,
+                    backup_timestamp TEXT,
+                    reason TEXT
+                )
+            """)
+            conn.commit()
+    
     def _load_state(self):
-        """Load state from checkpointer or create default"""
+        """Load state from SQLite database"""
         try:
-            # Try to load existing state from checkpointer
-            config = {"configurable": {"thread_id": self.thread_id}}
-            checkpoint = self.checkpointer.get(config)
-            
-            if checkpoint and "context_state" in checkpoint.get("channel_values", {}):
-                return checkpoint["channel_values"]["context_state"]
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    "SELECT state_json FROM dispute_contexts WHERE thread_id = ?", 
+                    (self.thread_id,)
+                )
+                row = cursor.fetchone()
+                
+                if row:
+                    state_data = json.loads(row[0])
+                    print(f"✅ Loaded existing context for thread: {self.thread_id}")
+                    print(f"📊 Previous state: {state_data.get('state', 'unknown')}")
+                    return state_data
+                    
         except Exception as e:
-            print(f"Could not load state: {e}")
+            print(f"⚠️ Could not load state: {e}")
         
         # Return default state
+        print(f"🆕 Creating new context for thread: {self.thread_id}")
         return {
             "state": "initial",
             "user_role": None,
@@ -41,25 +74,58 @@ class DisputeContext:
             "evidence": {},
             "answers": {},
             "tools_used": [],
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "session_count": 1
         }
     
     def _save_state(self):
-        """Save current state to checkpointer"""
+        """Save current state to SQLite database with backup"""
         try:
-            # We'll let the agent's natural checkpointing handle this
-            # For now, just track in memory
-            pass
+            self._state["timestamp"] = datetime.now().isoformat()
+            
+            with sqlite3.connect(self.db_path) as conn:
+                # Create backup of previous state
+                cursor = conn.execute(
+                    "SELECT state_json FROM dispute_contexts WHERE thread_id = ?", 
+                    (self.thread_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    conn.execute("""
+                        INSERT INTO context_backups 
+                        (thread_id, state_json, backup_timestamp, reason) 
+                        VALUES (?, ?, ?, ?)
+                    """, (
+                        self.thread_id,
+                        row[0],
+                        datetime.now().isoformat(),
+                        "auto_backup_before_update"
+                    ))
+                
+                # Save current state
+                conn.execute("""
+                    INSERT OR REPLACE INTO dispute_contexts 
+                    (thread_id, state_json, last_updated) 
+                    VALUES (?, ?, ?)
+                """, (
+                    self.thread_id,
+                    json.dumps(self._state, indent=2),
+                    datetime.now().isoformat()
+                ))
+                conn.commit()
+                
         except Exception as e:
-            print(f"Could not save state: {e}")
+            print(f"❌ Could not save state: {e}")
     
     def update_state(self, new_state: str):
+        """Update the current state and persist"""
+        old_state = self._state["state"]
         self._state["state"] = new_state
-        self._state["timestamp"] = datetime.now().isoformat()
         self._save_state()
+        print(f"🔄 State transition: {old_state} → {new_state}")
     
     def add_tool_usage(self, tool_name: str, args: dict, result: dict):
-        """Track tool usage"""
+        """Track tool usage and persist"""
         self._state["tools_used"].append({
             "tool": tool_name,
             "args": args,
@@ -67,24 +133,40 @@ class DisputeContext:
             "timestamp": datetime.now().isoformat()
         })
         self._save_state()
+        print(f"🔧 Tool used: {tool_name}")
     
     def set_order_id(self, order_id: str):
+        """Set order ID and persist"""
+        old_id = self._state["order_id"]
         self._state["order_id"] = order_id
         self._save_state()
+        if old_id != order_id:
+            print(f"📝 Order ID {'updated' if old_id else 'set'}: {order_id}")
     
     def set_user_role(self, role: str):
+        """Set user role and persist"""
         self._state["user_role"] = role
         self._save_state()
+        print(f"👤 User role set: {role}")
     
     def add_evidence(self, evidence: dict):
+        """Add evidence and persist"""
         self._state["evidence"] = evidence
         self._save_state()
+        print(f"📸 Evidence added (confidence: {evidence.get('confidence', 0):.1%})")
     
     def add_answers(self, answers: str):
-        self._state["answers"]["customer_responses"] = answers
+        """Add customer answers and persist"""
+        if "customer_responses" not in self._state["answers"]:
+            self._state["answers"]["customer_responses"] = answers
+        else:
+            # Append if there are already responses
+            self._state["answers"]["customer_responses"] += "\n\n" + answers
         self._save_state()
+        print(f"💬 Customer responses recorded")
     
     def get_summary(self) -> str:
+        """Get formatted context summary"""
         evidence_status = "Sufficient" if self._state["evidence"].get("confidence", 0) > 0.7 else "Insufficient"
         return f"""
 === DISPUTE CONTEXT STATE ===
@@ -96,16 +178,104 @@ Evidence Status: {evidence_status}
 Tools Used: {len(self._state["tools_used"])}
 Last Updated: {self._state["timestamp"]}
 Ready for Verdict: {self.is_ready_for_verdict()}
+Session Count: {self._state.get('session_count', 1)}
 ============================="""
     
     def is_ready_for_verdict(self) -> bool:
+        """Check if all required data is available for verdict"""
         has_order = bool(self._state["order_id"])
         has_evidence = bool(self._state["evidence"]) and self._state["evidence"].get("confidence", 0) > 0.7
-        has_answers = bool(self._state["answers"])
+        has_answers = bool(self._state["answers"].get("customer_responses"))
         return has_order and has_evidence and has_answers
     
     def get_state(self):
+        """Get copy of current state"""
         return self._state.copy()
+    
+    def reset_context(self):
+        """Reset context for new dispute (optional utility method)"""
+        # Backup current state before reset
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO context_backups 
+                (thread_id, state_json, backup_timestamp, reason) 
+                VALUES (?, ?, ?, ?)
+            """, (
+                self.thread_id,
+                json.dumps(self._state),
+                datetime.now().isoformat(),
+                "manual_reset"
+            ))
+            conn.commit()
+        
+        self._state = {
+            "state": "initial",
+            "user_role": None,
+            "order_id": None,
+            "evidence": {},
+            "answers": {},
+            "tools_used": [],
+            "timestamp": datetime.now().isoformat(),
+            "session_count": self._state.get('session_count', 0) + 1
+        }
+        self._save_state()
+        print("🔄 Context reset - previous state backed up")
+    
+    def get_thread_history(self):
+        """Get all available threads"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("""
+                    SELECT thread_id, last_updated, 
+                           json_extract(state_json, '$.state') as current_state,
+                           json_extract(state_json, '$.order_id') as order_id
+                    FROM dispute_contexts 
+                    ORDER BY last_updated DESC
+                """)
+                return cursor.fetchall()
+        except Exception as e:
+            print(f"❌ Could not fetch thread history: {e}")
+            return []
+    
+    def export_context(self, file_path: str = None):
+        """Export context to JSON file for debugging"""
+        if not file_path:
+            file_path = f"context_export_{self.thread_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        try:
+            export_data = {
+                "thread_id": self.thread_id,
+                "export_timestamp": datetime.now().isoformat(),
+                "current_state": self._state,
+                "thread_history": self.get_thread_history()
+            }
+            
+            with open(file_path, 'w') as f:
+                json.dump(export_data, f, indent=2)
+            
+            print(f"📤 Context exported to: {file_path}")
+            return file_path
+        except Exception as e:
+            print(f"❌ Could not export context: {e}")
+            return None
+    
+    def validate_state(self) -> bool:
+        """Validate current state integrity"""
+        required_keys = ["state", "user_role", "order_id", "evidence", "answers", "tools_used", "timestamp"]
+        
+        for key in required_keys:
+            if key not in self._state:
+                print(f"⚠️ Missing required key: {key}")
+                return False
+        
+        # Validate state values
+        valid_states = ["initial", "initiated", "evidence_collected", "questioning", "responses_collected", "completed"]
+        if self._state["state"] not in valid_states:
+            print(f"⚠️ Invalid state: {self._state['state']}")
+            return False
+        
+        print("✅ State validation passed")
+        return True
 
 # Global context will be initialized per thread
 dispute_context = None
@@ -232,7 +402,7 @@ def _merge_analyses(per_image: list[dict]) -> dict:
     # In production, you'd merge multiple analyses
     return per_image[0]
 
-# ===== TOOLS WITH CONTEXT TRACKING =====
+# ===== ENHANCED TOOLS WITH CONTEXT TRACKING =====
 @tool(parse_docstring=True)
 def initiate_mediation_flow(order_id: str | None = None, user_role: str = "customer"):
     """Initialize the packaging dispute resolution process.
@@ -408,12 +578,16 @@ def store_customer_responses(responses: str, order_id: str | None = None):
             dispute_context.set_order_id(order_id)
         dispute_context.update_state("responses_collected")
     
+    # Check if we have order_id now
+    needs_order_id = not (dispute_context and dispute_context.get_state().get("order_id"))
+    
     result = {
         "status": "stored",
         "responses": responses,
         "order_id": order_id,
-        "message": "Responses recorded. Ready for verdict with order ID.",
-        "next_action": "finalize_verdict"
+        "message": "Responses recorded.",
+        "next_action": "Ask for order_id to proceed with finalization" if needs_order_id else "Ready for finalization with order_id",
+        "needs_order_id": needs_order_id
     }
     
     if dispute_context:
@@ -451,8 +625,8 @@ def finalize_verdict(order_id: str):
     
     # Determine severity and exposure
     damage = evidence.get("damage", {})
-    severity = damage.get("severity", "severe")  # Default to severe for demo
-    is_exposed = damage.get("is_product_exposed", True)  # Default to exposed for demo
+    severity = damage.get("severity", "severe")  # Default to severe for safety
+    is_exposed = damage.get("is_product_exposed", True)  # Default to exposed for safety
     
     # Decision logic
     if severity == "severe" or is_exposed:
@@ -495,13 +669,64 @@ def finalize_verdict(order_id: str):
         "rationale": rationale,
         "payout_band": payout_band,
         "next_steps": next_steps,
-        "resolution_time": datetime.now().isoformat()
+        "resolution_time": datetime.now().isoformat(),
+        "evidence_summary": {
+            "confidence": evidence.get("confidence", 0.0),
+            "damage_severity": severity,
+            "product_exposed": is_exposed
+        }
     }
     
     if dispute_context:
         dispute_context.update_state("completed")
         dispute_context.add_tool_usage("finalize_verdict", {"order_id": order_id}, result)
         print(dispute_context.get_summary())
+    
+    return result
+
+@tool(parse_docstring=True)
+def get_context_help():
+    """Get information about current context state and available commands."""
+    global dispute_context
+    
+    if not dispute_context:
+        return {"status": "error", "message": "No context available"}
+    
+    state = dispute_context.get_state()
+    
+    # Determine what can be done next
+    next_actions = []
+    current_state = state.get("state", "initial")
+    
+    if current_state == "initial":
+        next_actions.append("Report damage to start dispute resolution")
+    elif current_state == "initiated":
+        next_actions.append("Provide photo paths or directory for evidence collection")
+    elif current_state == "evidence_collected":
+        next_actions.append("Answer follow-up questions about the damage")
+    elif current_state == "questioning":
+        next_actions.append("Provide answers to the safety and impact questions")
+    elif current_state == "responses_collected":
+        if not state.get("order_id"):
+            next_actions.append("Provide order ID to finalize verdict")
+        else:
+            next_actions.append("Finalize verdict (all requirements met)")
+    elif current_state == "completed":
+        next_actions.append("Case completed - start new dispute or export context")
+    
+    result = {
+        "status": "ok",
+        "current_context": dispute_context.get_summary(),
+        "thread_id": dispute_context.thread_id,
+        "next_actions": next_actions,
+        "ready_for_verdict": dispute_context.is_ready_for_verdict(),
+        "available_commands": [
+            "/reset - Reset current context",
+            "/export - Export context to file", 
+            "/threads - List all available threads",
+            "/help - Show this help"
+        ]
+    }
     
     return result
 
@@ -517,12 +742,21 @@ VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
 
 SYSTEM_MESSAGE = """You are GrabFood's AI Dispute Resolution Agent, specialized in resolving packaging damage claims.
 
+**CONTEXT AWARENESS**: You have persistent context across sessions. Check the current state and continue appropriately.
+
 **WORKFLOW**:
-1. When customer reports damage, call `initiate_mediation_flow` 
-2. When photo paths provided, call `collect_evidence`
-3. After evidence collected (confidence >70%), call `ask_follow_up_questions`
-4. When customer provides answers, call `store_customer_responses` 
-5. When order_id available, call `finalize_verdict`
+1. When customer reports damage → call `initiate_mediation_flow`
+2. When photo paths provided → call `collect_evidence` 
+3. After evidence collected (confidence >70%) → call `ask_follow_up_questions`
+4. When customer answers questions → call `store_customer_responses`
+5. When order_id available and all data collected → call `finalize_verdict`
+
+**STATE-AWARE RESPONSES**:
+- Always check current context state from the summary
+- If state is "questioning" and user provides answers → store responses
+- If state is "responses_collected" but no order_id → ask for order_id
+- If ready for verdict → proceed with finalization
+- If customer provides file paths, treat them as photo evidence
 
 **DECISION FRAMEWORK**:
 - SEVERE damage + product exposed = Full refund + replacement
@@ -530,24 +764,152 @@ SYSTEM_MESSAGE = """You are GrabFood's AI Dispute Resolution Agent, specialized 
 - MINOR damage = Partial refund
 - NO damage = Deny claim
 
-**TOOL USAGE RULES**:
-- ALWAYS call initiate_mediation_flow when damage is first reported
-- ALWAYS call collect_evidence when photo paths are provided
-- ALWAYS call store_customer_responses when customer answers questions
-- ALWAYS call finalize_verdict with order_id when ready
+**SPECIAL COMMANDS**:
+- If user types "/help" → call `get_context_help`
+- If user types "/reset" → suggest context reset
+- If user types "/export" → suggest context export
 
-Be proactive with tools - don't just ask for information, use the tools to collect and process it.
+Be proactive with tools, context-aware, and always maintain conversation flow based on current state.
 """
 
 llm = ChatOpenAI(model=ASSISTANT_MODEL, temperature=0.3)
-tools = [initiate_mediation_flow, collect_evidence, ask_follow_up_questions, store_customer_responses, finalize_verdict]
+tools = [
+    initiate_mediation_flow, 
+    collect_evidence, 
+    ask_follow_up_questions, 
+    store_customer_responses, 
+    finalize_verdict,
+    get_context_help
+]
 
+# ===== INTERACTIVE MODE FUNCTIONS =====
+def handle_special_commands(user_input: str) -> bool:
+    """Handle special commands like /help, /reset, etc. Returns True if command was handled."""
+    global dispute_context
+    
+    if not user_input.startswith('/'):
+        return False
+    
+    command = user_input.lower().strip()
+    
+    if command == '/help':
+        print("\n🆘 Available Commands:")
+        print("  /help     - Show this help")
+        print("  /reset    - Reset current dispute context")
+        print("  /export   - Export context to JSON file")
+        print("  /threads  - List all dispute threads")
+        print("  /validate - Validate current context state")
+        print("  /quit     - Exit the application")
+        print("\n📋 Current Context:")
+        if dispute_context:
+            print(dispute_context.get_summary())
+        return True
+    
+    elif command == '/reset':
+        if dispute_context:
+            confirm = input("⚠️  Are you sure you want to reset the context? (y/N): ").lower()
+            if confirm == 'y':
+                dispute_context.reset_context()
+                print("✅ Context has been reset")
+            else:
+                print("❌ Reset cancelled")
+        else:
+            print("❌ No context to reset")
+        return True
+    
+    elif command == '/export':
+        if dispute_context:
+            file_path = dispute_context.export_context()
+            if file_path:
+                print(f"✅ Context exported successfully")
+            else:
+                print("❌ Export failed")
+        else:
+            print("❌ No context to export")
+        return True
+    
+    elif command == '/threads':
+        if dispute_context:
+            threads = dispute_context.get_thread_history()
+            if threads:
+                print("\n📋 Available Dispute Threads:")
+                for i, (thread_id, last_updated, state, order_id) in enumerate(threads, 1):
+                    order_info = f" (Order: {order_id})" if order_id else " (No Order ID)"
+                    print(f"  {i}. {thread_id} - {state}{order_info}")
+                    print(f"     Last Updated: {last_updated}")
+            else:
+                print("❌ No threads found")
+        else:
+            print("❌ No context available")
+        return True
+    
+    elif command == '/validate':
+        if dispute_context:
+            is_valid = dispute_context.validate_state()
+            if is_valid:
+                print("✅ Context state is valid")
+            else:
+                print("❌ Context state validation failed")
+        else:
+            print("❌ No context to validate")
+        return True
+    
+    elif command in ['/quit', '/exit', '/q']:
+        print("👋 Goodbye!")
+        return True
+    
+    else:
+        print(f"❌ Unknown command: {command}")
+        print("💡 Type /help for available commands")
+        return True
+
+def detect_file_paths(user_input: str) -> list[str]:
+    """Detect if user input contains file paths"""
+    import re
+    
+    # Pattern to match file paths (Unix/Linux style)
+    path_pattern = r'(/[\w\-_\.\s\(\)]+)+\.(png|jpg|jpeg|gif|bmp|webp|heic)'
+    matches = re.findall(path_pattern, user_input, re.IGNORECASE)
+    
+    if matches:
+        # Extract just the full paths
+        paths = []
+        for match in re.finditer(path_pattern, user_input, re.IGNORECASE):
+            paths.append(match.group(0))
+        return paths
+    
+    return []
+
+def preprocess_user_input(user_input: str) -> str:
+    """Preprocess user input to handle file paths and context"""
+    global dispute_context
+    
+    # Check for file paths
+    file_paths = detect_file_paths(user_input)
+    if file_paths:
+        print(f"🔍 Detected {len(file_paths)} file path(s): {', '.join(file_paths)}")
+        
+        # If we're in initial state and files are provided, suggest evidence collection
+        if dispute_context and dispute_context.get_state().get("state") == "initial":
+            return f"I have photos of damaged packaging at these paths: {', '.join(file_paths)}"
+        elif dispute_context and dispute_context.get_state().get("state") in ["initiated", "evidence_collected"]:
+            return f"Here are photos of the damage: {', '.join(file_paths)}"
+    
+    return user_input
+
+# ===== MAIN EXECUTION =====
 if __name__ == "__main__":
     try:
-        with SqliteSaver.from_conn_string(os.getenv("CHECKPOINT_DB", "state.db")) as memory:
-            # Initialize context for this thread
+        # Use separate DB for LangGraph checkpoints and our context
+        langgraph_db = os.getenv("CHECKPOINT_DB", "langgraph_checkpoints.db")
+        
+        with SqliteSaver.from_conn_string(langgraph_db) as memory:
+            # Initialize context for this thread  
             thread_id = os.getenv("THREAD_ID", "grabhack_demo")
             dispute_context = DisputeContext(memory, thread_id)
+            
+            # Validate context on startup
+            dispute_context.validate_state()
             
             agent_executor = create_react_agent(llm, tools, checkpointer=memory, prompt=SYSTEM_MESSAGE)
             config = {"configurable": {"thread_id": thread_id}}
@@ -557,29 +919,87 @@ if __name__ == "__main__":
             print("Context Engineering Enhanced Version")
             print("==========================================")
             print(dispute_context.get_summary())
+            print("\n💡 Type /help for commands or describe your packaging issue")
+            print("📝 Example: 'Hi, I just received my GrabFood order and the packaging is damaged'")
+            print("📁 You can also provide file paths directly: '/home/user/damage_photo.png'")
+            print("="*60)
             
-            demo_message = {
-                "role": "user", 
-                "content": """No, I haven’t consumed it, so no health issues.
-
-Yes, I’ve set it aside and won’t consume it.
-
-Yes, there’s a smell — it’s unpleasant, like spoiled food/oil.
-
-I noticed the damage immediately upon delivery.
-
-This has affected my meal plans — I would like a replacement as soon as possible."""
-            }
+            # Interactive mode
+            while True:
+                try:
+                    user_input = input("\n👤 User: ").strip()
+                    
+                    if not user_input:
+                        continue
+                    
+                    # Handle special commands
+                    if handle_special_commands(user_input):
+                        if user_input.lower() in ['/quit', '/exit', '/q']:
+                            break
+                        continue
+                    
+                    # Preprocess input for file paths and context
+                    processed_input = preprocess_user_input(user_input)
+                    if processed_input != user_input:
+                        print(f"🔄 Interpreted as: {processed_input}")
+                    
+                    print(f"\n🤖 Processing...")
+                    
+                    # Execute agent
+                    messages_processed = False
+                    for step in agent_executor.stream(
+                        {"messages": [{"role": "user", "content": processed_input}]}, 
+                        config, 
+                        stream_mode="values"
+                    ):
+                        if step.get("messages"):
+                            step["messages"][-1].pretty_print()
+                            messages_processed = True
+                    
+                    if not messages_processed:
+                        print("⚠️ No response generated. Please try again.")
+                    
+                    # Show updated context
+                    print("\n" + "="*60)
+                    print(dispute_context.get_summary())
+                    
+                    # Show helpful next steps
+                    state = dispute_context.get_state()
+                    current_state = state.get("state", "initial")
+                    
+                    if current_state == "initiated":
+                        print("💡 Next: Provide photo paths or say 'I have photos at [path]'")
+                    elif current_state == "evidence_collected":
+                        print("💡 Next: Answer the follow-up questions about safety and impact")
+                    elif current_state == "responses_collected" and not state.get("order_id"):
+                        print("💡 Next: Provide your order ID to complete the resolution")
+                    elif dispute_context.is_ready_for_verdict():
+                        print("💡 Ready: All information collected, proceeding with final verdict")
+                    
+                except KeyboardInterrupt:
+                    print("\n\n🛑 Interrupted by user")
+                    confirm = input("Do you want to exit? (y/N): ").lower()
+                    if confirm == 'y':
+                        break
+                    else:
+                        print("Continuing...")
+                        continue
+                        
+                except Exception as e:
+                    print(f"❌ Error processing request: {e}")
+                    print("🔄 Please try again or type /help for assistance")
+                    continue
             
-            for step in agent_executor.stream(
-                {"messages": [demo_message]}, config, stream_mode="values"
-            ):
-                step["messages"][-1].pretty_print()
-            
-            print("\n=== FINAL CONTEXT STATE ===")
-            print(dispute_context.get_summary())
+            # Final export option
+            if dispute_context and dispute_context.get_state().get("state") != "initial":
+                export_option = input("\n💾 Would you like to export the context before exiting? (y/N): ").lower()
+                if export_option == 'y':
+                    dispute_context.export_context()
         
     except Exception as e:
-        print(f"Agent execution failed: {e}")
+        print(f"💥 Critical error: {e}")
+        print("🔧 Please check your configuration and try again")
     
-    print("\nAgent run complete.")
+    finally:
+        print("\n🏁 GrabFood Dispute Agent session ended")
+        print("📊 Context has been automatically saved and will persist for next session")
