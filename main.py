@@ -268,8 +268,8 @@ Session Count: {self._state.get('session_count', 1)}
                 print(f"⚠️ Missing required key: {key}")
                 return False
         
-        # Validate state values
-        valid_states = ["initial", "initiated", "evidence_collected", "questioning", "responses_collected", "completed"]
+        # Validate state values - UPDATED with new state
+        valid_states = ["initial", "initiated", "evidence_collected", "needs_more_photos", "questioning", "responses_collected", "completed"]
         if self._state["state"] not in valid_states:
             print(f"⚠️ Invalid state: {self._state['state']}")
             return False
@@ -300,7 +300,7 @@ def collect_photos(paths: list[str] | None = None, dir: str | None = None):
     if paths:
         resolved_paths = paths
     else:
-        search_dir = dir or os.getenv("IMAGES_DIR")
+        search_dir = dir
         if search_dir:
             p = Path(search_dir)
             for pattern in exts:
@@ -343,7 +343,8 @@ def _describe_with_vision(image_b64: str) -> dict:
         "2. Damage severity: none, minor, moderate, severe\n"
         "3. Product exposure: is the actual product visible or contaminated?\n"
         "4. Leak details: color, substance type, extent\n"
-        "5. Photo quality: can you see the full package clearly?\n\n"
+        "5. Photo quality: can you see the full package clearly?\n"
+        "6. Confidence score (0–1): Calculate confidence based on a weighted combination of factors — extent of visible damage, severity level, packaging condition, product exposure, and leak evidence. Adjust this score with a photo-quality modifier (lower confidence if the photo is unclear, higher if the photo is sharp and complete). The final score should reflect both how severe the damage is and how certain the assessment is, clamped between 0 and 1.\n\n"
         
         "Return JSON with these exact fields:\n"
         "{\n"
@@ -356,7 +357,7 @@ def _describe_with_vision(image_b64: str) -> dict:
         '    "substance_color": ["red", "clear"],\n'
         '    "is_product_exposed": true/false\n'
         '  },\n'
-        '  "confidence": 0.85,\n'
+        '  "confidence": [0.0-1.0],\n'
         '  "needs_more_photos": true/false\n'
         "}"
     )
@@ -483,6 +484,7 @@ def collect_evidence(paths: list[str] | None = None, dir: str | None = None):
     types = ", ".join(dmg.get("types", [])) or "no visible damage"
     severity = dmg.get("severity", "unknown")
     confidence = agg.get("confidence", 0.0)
+    needs_more_photos = bool(agg.get("needs_more_photos"))
     
     description = f"Analysis: {types} (severity: {severity}) on {colors} packaging. Confidence: {confidence:.1%}"
     
@@ -491,14 +493,30 @@ def collect_evidence(paths: list[str] | None = None, dir: str | None = None):
         "description": description,
         "structured": agg,
         "confidence": confidence,
-        "needs_more_photos": bool(agg.get("needs_more_photos")),
-        "can_proceed_to_questions": confidence > 0.7,
+        "needs_more_photos": needs_more_photos,
+        "can_proceed_to_questions": confidence > 0.7 and not needs_more_photos,
         "analyzed_paths": [p.get("path") for p in valid],
     }
     
+    # Add specific guidance for more photos if needed
+    if needs_more_photos:
+        result["photo_guidance"] = [
+            "Take a closer shot of the damaged area",
+            "Capture the package from different angles", 
+            "Ensure good lighting to see damage details clearly",
+            "Show the full package and the damaged portion",
+            "Include any leaked substances or stains"
+        ]
+    
     if dispute_context:
         dispute_context.add_evidence(agg)
-        dispute_context.update_state("evidence_collected")
+        
+        # Update state based on photo sufficiency
+        if needs_more_photos:
+            dispute_context.update_state("needs_more_photos")
+        else:
+            dispute_context.update_state("evidence_collected")
+            
         dispute_context.add_tool_usage("collect_evidence", {"paths": paths, "dir": dir}, result)
         print(dispute_context.get_summary())
     
@@ -507,11 +525,35 @@ def collect_evidence(paths: list[str] | None = None, dir: str | None = None):
 @tool(parse_docstring=True)
 def ask_follow_up_questions(target_role: str = "customer"):
     """Generate targeted questions based on evidence analysis.
+    Only call this when evidence is sufficient (needs_more_photos = false).
 
     Args:
         target_role: 'customer' or 'driver' - who should answer
     """
     global dispute_context
+    
+    # Check if evidence is sufficient before proceeding
+    if dispute_context:
+        state = dispute_context.get_state()
+        evidence = state.get("evidence", {})
+        needs_more_photos = evidence.get("needs_more_photos", True)
+        confidence = evidence.get("confidence", 0.0)
+        
+        if needs_more_photos:
+            return {
+                "status": "error",
+                "reason": "insufficient_photos",
+                "message": "More photos are needed before proceeding to questions",
+                "next_action": "collect_additional_evidence"
+            }
+        
+        if confidence <= 0.7:
+            return {
+                "status": "error", 
+                "reason": "low_confidence",
+                "message": f"Evidence confidence too low ({confidence:.1%}). More photos needed.",
+                "next_action": "collect_additional_evidence"
+            }
     
     questions = [
         {
@@ -702,6 +744,11 @@ def get_context_help():
         next_actions.append("Report damage to start dispute resolution")
     elif current_state == "initiated":
         next_actions.append("Provide photo paths or directory for evidence collection")
+    elif current_state == "needs_more_photos":
+        evidence = state.get("evidence", {})
+        confidence = evidence.get("confidence", 0.0)
+        next_actions.append(f"Provide additional photos (current confidence: {confidence:.1%})")
+        next_actions.append("Take closer shots, different angles, or better lighting")
     elif current_state == "evidence_collected":
         next_actions.append("Answer follow-up questions about the damage")
     elif current_state == "questioning":
@@ -747,12 +794,20 @@ SYSTEM_MESSAGE = """You are GrabFood's AI Dispute Resolution Agent, specialized 
 **WORKFLOW**:
 1. When customer reports damage → call `initiate_mediation_flow`
 2. When photo paths provided → call `collect_evidence` 
-3. After evidence collected (confidence >70%) → call `ask_follow_up_questions`
-4. When customer answers questions → call `store_customer_responses`
-5. When order_id available and all data collected → call `finalize_verdict`
+3. **IF `needs_more_photos` is true → ask for additional photos and call `collect_evidence` again**
+4. **ONLY when `needs_more_photos` is false AND confidence >70% → call `ask_follow_up_questions`**
+5. When customer answers questions → call `store_customer_responses`
+6. When order_id available and all data collected → call `finalize_verdict`
+
+**EVIDENCE COLLECTION LOGIC**:
+- If evidence analysis returns `needs_more_photos: true`, politely ask for additional photos
+- Explain what specific angles or details are needed (closer shots, different angles, better lighting)
+- Continue collecting evidence until `needs_more_photos: false`
+- Only proceed to questions when evidence is sufficient
 
 **STATE-AWARE RESPONSES**:
 - Always check current context state from the summary
+- If state is "evidence_collected" but `needs_more_photos` is true → request more photos
 - If state is "questioning" and user provides answers → store responses
 - If state is "responses_collected" but no order_id → ask for order_id
 - If ready for verdict → proceed with finalization
@@ -905,7 +960,7 @@ if __name__ == "__main__":
         
         with SqliteSaver.from_conn_string(langgraph_db) as memory:
             # Initialize context for this thread  
-            thread_id = os.getenv("THREAD_ID", "grabhack_demo")
+            thread_id = os.getenv("THREAD_ID", "grabhack_demo168")
             dispute_context = DisputeContext(memory, thread_id)
             
             # Validate context on startup
@@ -969,6 +1024,11 @@ if __name__ == "__main__":
                     
                     if current_state == "initiated":
                         print("💡 Next: Provide photo paths or say 'I have photos at [path]'")
+                    elif current_state == "needs_more_photos":
+                        evidence = state.get("evidence", {})
+                        confidence = evidence.get("confidence", 0.0)
+                        print(f"📸 Next: More photos needed (current confidence: {confidence:.1%})")
+                        print("💡 Try: Different angles, closer shots, better lighting")
                     elif current_state == "evidence_collected":
                         print("💡 Next: Answer the follow-up questions about safety and impact")
                     elif current_state == "responses_collected" and not state.get("order_id"):
